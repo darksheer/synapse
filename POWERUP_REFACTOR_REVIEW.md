@@ -159,3 +159,40 @@ By decoupling the backend service from Synapse's internal Python abstractions (`
 *   **Resilience:** If the Go service crashes, it does not disrupt the Cortex cluster.
 *   **Scale:** You can horizontally scale the Go/Rust collector pods independently of Cortex.
 *   **Polyglot:** You are no longer restricted to Python libraries for parsing complex file formats or handling high-throughput networking.
+
+---
+
+## Operational Considerations & Potential Blind Spots
+While moving to a compiled, decoupled backend provides massive architectural benefits, it is crucial to address the operational realities of building and maintaining these Advanced Power-Ups. What are we missing when we remove the tight Python/Telepath coupling?
+
+### 1. Web UI Interface (Optic) Management
+**The Concern:** If the backend is written in Go or Rust, how do we build the UI for analysts to interact with it inside Synapse Optic?
+
+**The Reality:** The Optic UI is entirely driven by JSON configuration files located within the `optic` directory of a Storm Package.
+*   Because your Go/Rust service *must* install a Storm Package into Cortex to register its commands, you simply include the Optic configuration in that same package.
+*   The Optic UI calls Storm commands (which hit your Go/Rust HTTP API), and renders nodes based on the models you defined in the package.
+*   **Verdict:** You lose no UI capabilities. Optic does not care what language the backend is written in, because it only ever speaks Storm.
+
+### 2. Configuration and Secrets Management
+**The Concern:** Synapse has built-in ways to manage secrets (`$lib.vault`) and Cell configurations (`cell.yaml`). Where do API keys for third-party services (like Shodan or MISP) live now?
+
+**The Reality:** You now have a split-brain configuration problem that you must architect carefully:
+*   **Analyst-Provided Secrets:** If the analyst needs to provide their own API key to use the Power-Up, they must use Synapse's native `$lib.vault` via a setup command (e.g., `my_powerup.setup.apikey <key>`). Your Storm command will retrieve this from the vault and pass it as a header in the HTTP request to your Go/Rust service.
+*   **Global Service Secrets:** If the Go/Rust service requires global credentials (e.g., a database password or a massive enterprise API key), those should *not* be in Synapse. They should be provided to the Go/Rust container via standard Environment Variables or a Kubernetes Secret.
+
+### 3. Internal Network Security
+**The Concern:** If the Go/Rust service exposes an HTTP API (e.g., `http://my-golang-powerup:8080/scan`) for Synapse to call, what stops someone else on the network from calling it directly and bypassing Synapse's authentication?
+
+**The Reality:** You must secure the HTTP bridge.
+*   Because the service is decoupled from Telepath, it no longer inherits Synapse's mutual TLS (mTLS) certificate trust.
+*   **Solution:** You must implement a shared secret mechanism. When the Go/Rust service starts, it generates (or is provided) a secure token. When it registers its Storm Package with Cortex, it hardcodes that token into the HTTP headers of its commands. The Go/Rust service must reject any incoming HTTP request that does not contain this token. Alternatively, enforce strict network policies (e.g., Kubernetes NetworkPolicies) so only the Cortex pod can reach the Go/Rust pod.
+
+### 4. Developer Workflows (Creation, Updating, Testing)
+**The Concern:** Building a Power-Up now requires knowledge of Go/Rust *and* Storm. How do developers test and package this?
+
+**The Reality:** The developer workflow becomes more complex but highly standardized:
+*   **The Monorepo Approach:** The Git repository for the Power-Up must contain both the Go/Rust source code and the `storm` directory (containing the `.yaml` and `.storm` files).
+*   **Local Testing:** Developers will use `docker-compose`. They will spin up a local Synapse Cortex, their local Go/Rust service, and a script to auto-load the Storm Package into Cortex. This allows rapid end-to-end testing.
+*   **CI/CD Pipeline:** Your build pipeline must do two things:
+    1. Compile the Go/Rust binary.
+    2. Package the `storm` directory into the binary (using `go:embed` or Rust's `include_bytes!`). This ensures that the single compiled artifact contains exactly the right version of the Storm Package required to interface with it, preventing version drift.
