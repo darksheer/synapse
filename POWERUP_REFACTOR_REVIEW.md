@@ -174,18 +174,24 @@ While moving to a compiled, decoupled backend provides massive architectural ben
 *   **Verdict:** You lose no UI capabilities. Optic does not care what language the backend is written in, because it only ever speaks Storm.
 
 ### 2. Configuration and Secrets Management
-**The Concern:** Synapse has built-in ways to manage secrets (`$lib.vault`) and Cell configurations (`cell.yaml`). Where do API keys for third-party services (like Shodan or MISP) live now?
+**The Concern:** Synapse has built-in ways to manage secrets (`$lib.vault`) and Cell configurations (`cell.yaml`). Where do API keys for third-party services (like Shodan or MISP) live now? If the backend is decoupled, does the DevOps team now have to manage secrets in multiple places (a "split-brain" problem)?
 
-**The Reality:** You now have a split-brain configuration problem that you must architect carefully:
-*   **Analyst-Provided Secrets:** If the analyst needs to provide their own API key to use the Power-Up, they must use Synapse's native `$lib.vault` via a setup command (e.g., `my_powerup.setup.apikey <key>`). Your Storm command will retrieve this from the vault and pass it as a header in the HTTP request to your Go/Rust service.
-*   **Global Service Secrets:** If the Go/Rust service requires global credentials (e.g., a database password or a massive enterprise API key), those should *not* be in Synapse. They should be provided to the Go/Rust container via standard Environment Variables or a Kubernetes Secret.
+**The Reality:** The most modern and secure approach is to treat the Go/Rust backend service as a **Stateless Worker**. Synapse itself remains the single source of truth for all Power-Up configurations and credentials.
+
+You completely avoid the "split-brain" anti-pattern by leveraging Synapse's native `$lib.vault` for *everything*:
+*   **Analyst-Provided Secrets:** If the analyst uses a personal API key, they configure it via a setup command (e.g., `my_powerup.setup.apikey <key>`). When the analyst runs a Storm command, the Storm code retrieves the key using `$lib.vault` and securely passes it to the Go/Rust service as an HTTP header (e.g., `X-API-Key`). The Go/Rust service uses the key in-memory for that specific request and discards it.
+*   **Global Service Secrets:** If the Power-Up requires a global credential to run a background synchronization job (e.g., an enterprise MISP feed key), the Synapse Administrator still stores it in Synapse's `$lib.vault`.
+    *   *How does the background worker get it?* When the Go/Rust service wakes up to run its cron loop, it first makes an authenticated HTTP call to Synapse (`/api/v1/storm`) asking for its configuration: `yield $lib.vault.get('my_powerup:global_key')`.
+    *   It retrieves the key Just-In-Time (JIT), uses it to fetch the external data, and then discards the key.
+
+This ensures that backing up Cortex backs up all secrets, migrating Cortex migrates all secrets, and DevOps does not need to inject complex environment variables or Kubernetes Secrets into the Power-Up containers.
 
 ### 3. Internal Network Security
 **The Concern:** If the Go/Rust service exposes an HTTP API (e.g., `http://my-golang-powerup:8080/scan`) for Synapse to call, what stops someone else on the network from calling it directly and bypassing Synapse's authentication?
 
 **The Reality:** You must secure the HTTP bridge.
 *   Because the service is decoupled from Telepath, it no longer inherits Synapse's mutual TLS (mTLS) certificate trust.
-*   **Solution:** You must implement a shared secret mechanism. When the Go/Rust service starts, it generates (or is provided) a secure token. When it registers its Storm Package with Cortex, it hardcodes that token into the HTTP headers of its commands. The Go/Rust service must reject any incoming HTTP request that does not contain this token. Alternatively, enforce strict network policies (e.g., Kubernetes NetworkPolicies) so only the Cortex pod can reach the Go/Rust pod.
+*   **Solution:** You must implement a shared secret mechanism. When the Go/Rust service starts, it generates (or is provided via a secure orchestrator) an internal token. When it registers its Storm Package with Cortex, it hardcodes that token into the HTTP headers of its commands. The Go/Rust service must reject any incoming HTTP request that does not contain this token. Alternatively, enforce strict network policies (e.g., Kubernetes NetworkPolicies) so only the Cortex pod can reach the Go/Rust pod.
 
 ### 4. Developer Workflows (Creation, Updating, Testing)
 **The Concern:** Building a Power-Up now requires knowledge of Go/Rust *and* Storm. How do developers test and package this?
