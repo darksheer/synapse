@@ -67,3 +67,46 @@ To elevate Advanced Power-Ups to "first-class citizens," we recommend shifting a
 The feeling that supporting systems are "second-class citizens" is a natural consequence of forcing external integrations into a highly specialized, custom Python ecosystem designed for a core database engine.
 
 By leveraging Synapse's existing HTTP/REST capabilities, you can decouple Advanced Power-Ups from the Python core. Rewriting these connectors in Go or Rust will yield massive improvements in deployment, performance, and developer happiness, all while maintaining full compatibility with the Synapse platform. The first step should be to develop a simple, robust Go/Rust client library that wraps the `/api/v1/storm` endpoints.
+### How Commands, Triggers, and Crons are Configured
+You might be wondering: if the Advanced Power-Up is written in Go or Rust and sits "next to" Synapse, how does Synapse know about its commands, crons, or triggers?
+
+The answer lies in **Storm Packages** (`synapse.tools.storm.pkg.gen`).
+
+Even if the backend logic runs in a separate Go/Rust service, the "glue" that binds it to Synapse is a standard Storm Package (a YAML/JSON definition containing `.storm` files) loaded into Cortex. The external service does not require *any* modifications to the core Synapse engine.
+
+#### 1. Configuring Commands
+A custom command (e.g., `jira.issue.add`) is defined in the Storm Package that comes with your Power-Up. The Storm code for this command acts as a thin wrapper that uses Storm's built-in `$lib.inet.http` module to make an API call to your external Go/Rust service.
+
+```storm
+// Inside the Storm Package (e.g., jira.issue.add)
+$url = "http://my-golang-powerup:8080/v1/issue/add"
+$body = ({ "project": $project, "summary": $summary })
+$headers = ({ "Authorization": $lib.auth.getExtApiToken() })
+
+$resp = $lib.inet.http.post($url, headers=$headers, body=$body)
+if ($resp.code != 200) {
+    $lib.print("Error talking to Go service")
+    return()
+}
+// The Go service handled the API call, created the issue,
+// and perhaps even returned nodes for Synapse to yield.
+yield $resp.body.nodes
+```
+
+#### 2. Configuring Triggers
+Triggers in Synapse are native to Cortex (`synapse.lib.trigger`). You define the trigger entirely in Synapse using Storm (e.g., "when an `inet:ipv4` node is created, execute this Storm query").
+
+The Storm query executed by the trigger simply calls your custom command (defined above), which in turn sends an HTTP webhook to your Go/Rust service.
+*   **Synapse side:** Defines the trigger rule and calls `$lib.inet.http.post()`.
+*   **Go/Rust side:** Listens for incoming webhooks on an HTTP endpoint, receives the node data, processes it, and potentially pushes new intelligence back into Synapse via the `/api/v1/storm` API.
+
+#### 3. Configuring Crons (Scheduled Tasks)
+For crons, you have two architectural choices:
+*   **Synapse-Driven (Pull):** You create a native Synapse cron job (`synapse.lib.agenda`) that periodically executes a Storm command. That Storm command makes an HTTP GET request to your Go/Rust service, prompting the service to perform work and return results.
+*   **Service-Driven (Push):** This is often the better approach for modern languages. You completely bypass Synapse's cron system. Instead, you use standard cron libraries in Go/Rust (which are highly robust). The Go/Rust service wakes up on its own schedule, fetches external data (e.g., scraping a threat feed), and uses the Synapse `/api/v1/storm` HTTP endpoint to bulk-ingest the new nodes into Cortex.
+
+### Summary of the "Next-To" Architecture
+*   **No changes to Synapse are required.**
+*   The Go/Rust service sits "next to" Synapse as an independent container.
+*   The Synapse Administrator installs a lightweight Storm Package (`.yaml`) to register commands and triggers inside Cortex.
+*   Communication flows entirely over HTTP (REST/JSON) using `$lib.inet.http` (Cortex -> Service) and `/api/v1/storm` (Service -> Cortex).
