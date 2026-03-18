@@ -202,3 +202,44 @@ This ensures that backing up Cortex backs up all secrets, migrating Cortex migra
 *   **CI/CD Pipeline:** Your build pipeline must do two things:
     1. Compile the Go/Rust binary.
     2. Package the `storm` directory into the binary (using `go:embed` or Rust's `include_bytes!`). This ensures that the single compiled artifact contains exactly the right version of the Storm Package required to interface with it, preventing version drift.
+
+---
+
+## Architectural Blind Spots & Critical Engineering Hurdles
+When we decouple a Power-Up from the `synapse.telepath` framework and the `Cell` base class, we lose a massive amount of hidden "magic" that Synapse provides out of the box. To build a production-grade external Go/Rust service, you must explicitly architect solutions for the following systemic challenges.
+
+### 1. Handling Large Files (Axon Integration)
+**The Problem:** Synapse regularly handles multi-gigabyte malware samples or packet captures. If a Storm command tries to pass a 50MB file over the JSON HTTP bridge (`$lib.inet.http`) to your Go service for analysis, it will cause severe memory spikes, JSON parsing errors, and crashes on both sides.
+**The Solution:** The Go/Rust service must **never** receive raw bytes via the Cortex JSON API.
+*   The Storm command should only ever send the SHA256 hash (e.g., `file:bytes=...`) to the Go/Rust service.
+*   The Go/Rust service must be taught how to communicate directly with the **Axon HTTP API** (`/api/v1/axon/by/sha256/`).
+*   The service streams the bytes directly from the Axon blob store into memory (or local disk), processes them, and streams any resulting files back to the Axon.
+
+### 2. Long-Running Tasks & HTTP Timeouts
+**The Problem:** Telepath natively handles asynchronous, long-running generator execution without dropping connections. Standard HTTP requests (`$lib.inet.http`) will aggressively time out if your Go service takes 10 minutes to scrape a deep-web forum or analyze a massive file.
+**The Solution:** You must adopt an **Asynchronous Job / Callback Pattern**.
+1.  Synapse calls the Go service (e.g., `POST /v1/analyze/deepweb`).
+2.  The Go service immediately replies with `HTTP 202 Accepted` and a Job ID, freeing up the Cortex worker thread immediately.
+3.  The Go service processes the task in the background using goroutines or Rust async workers.
+4.  When finished, the Go service uses its internal Synapse client to POST the final nodes directly to the Cortex `/api/v1/storm` endpoint, effectively "calling Synapse back."
+
+### 3. Queueing and Backpressure
+**The Problem:** What happens if an analyst writes a bad Storm query that fires a trigger 50,000 times in 10 seconds? Cortex will attempt to make 50,000 synchronous HTTP calls to your Go service, effectively DDoS-ing it. Telepath handles connection pooling and queueing internally, but raw HTTP does not.
+**The Solution:** The Go/Rust service must implement strict load-shedding and queueing.
+*   **In-Memory Queueing:** The HTTP handler in Go should do nothing but drop the incoming payload onto a buffered channel or an internal job queue, instantly returning `200 OK` to Cortex.
+*   **External Broker:** For mission-critical tasks where dropping events is unacceptable, the Go service might need to place the event onto a durable queue (like Redis or RabbitMQ) before processing it.
+*   If the queue is full, the service must return an `HTTP 429 Too Many Requests`, and the Storm package must be written to handle backoff/retries gracefully.
+
+### 4. Observability and Task Status
+**The Problem:** In Synapse, you can view running tasks natively (`ps`). If your Go service is executing a 5-hour background job, how does the Synapse analyst know its progress or if it failed silently?
+**The Solution:** Model the Jobs as actual Nodes in the Cortex.
+*   When the Go service accepts a long-running job, it creates a custom node in Cortex (e.g., `my_powerup:job = <uuid> :status="running"`).
+*   As the Go service progresses, it updates the node's properties (`:progress=50`).
+*   If it fails, it updates the node (`:status="failed" :error="Timeout"`).
+*   The Optic UI can easily query these job nodes, giving the analyst real-time observability into the external backend without needing access to the Go service's logs.
+
+### 5. Multi-Cortex / Multi-Tenancy Architecture
+**The Problem:** In a massive enterprise, will you deploy one Go backend container for *every* Cortex (a 1:1 Sidecar model)? Or will you deploy a highly-available Go cluster that serves 5 different Cortexes simultaneously?
+**The Solution:**
+*   **Sidecar (1:1) - The Easiest Path:** The Go container sits next to a single Cortex, assumes it is talking to `localhost:4443`, and is completely stateless. This is the recommended starting point.
+*   **Multi-Tenant Cluster:** If you centralize the Power-Up, the Go service must become tenant-aware. It must inspect incoming HTTP headers (e.g., `X-Synapse-Tenant-ID`) to know which Cortex sent the request. Crucially, when it retrieves credentials JIT from the Vault, it must retrieve them from the correct tenant's `$lib.vault` so it does not accidentally use Company A's VirusTotal key to scan Company B's files.
