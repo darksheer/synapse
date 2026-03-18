@@ -110,3 +110,52 @@ For crons, you have two architectural choices:
 *   The Go/Rust service sits "next to" Synapse as an independent container.
 *   The Synapse Administrator installs a lightweight Storm Package (`.yaml`) to register commands and triggers inside Cortex.
 *   Communication flows entirely over HTTP (REST/JSON) using `$lib.inet.http` (Cortex -> Service) and `/api/v1/storm` (Service -> Cortex).
+
+---
+
+## Deep Dive: The Hosted Backend Lifecycle
+Because Advanced Power-Ups explicitly require a **hosted backend service**, refactoring them to a modern language means fundamentally changing how they are deployed and how they interface with Synapse.
+
+In the legacy Python model, Advanced Power-Ups are often built as a `synapse.lib.cell.Cell` subclass and form a tight cluster with Cortex using `Telepath` and `Nexus`.
+
+In the modernized model, the Advanced Power-Up is a completely standalone container (e.g., a Go binary) that treats Synapse simply as a database and event router with a REST API.
+
+Here is a deep dive into how this looks in practice.
+
+### 1. Deployment Model (The "Sidecar" or Microservice)
+You deploy your Advanced Power-Up exactly as you would deploy any modern microservice in Docker or Kubernetes.
+*   **The Go/Rust Container:** A scratch or Alpine-based Docker image containing only your compiled binary. It exposes an HTTP port (e.g., `8080`) to receive webhook requests from Synapse.
+*   **Network Proximity:** It is deployed alongside Cortex. It only needs network access to the Cortex HTTP API port (usually `4443` or `443`), and Cortex needs network access to the Go/Rust container's port.
+
+### 2. The Bootstrapping Phase
+A common challenge is: *How does Synapse know this new backend service exists if they don't share a custom Python RPC framework?*
+
+The Go/Rust service bootstraps itself upon startup:
+1.  **Startup:** The Go/Rust service spins up and connects to its own dependencies (Redis, external APIs, etc.).
+2.  **Authentication:** It uses a configured Synapse API key or Service Account Token.
+3.  **Self-Registration:** The service contains the Storm Package definitions (`.yaml` and `.storm` files) bundled directly inside its binary. On startup, the service makes an HTTP POST request to the Synapse `/api/v1/storm` endpoint, sending a Storm query like: `$lib.pkg.add($my_pkg_def)`.
+4.  **Result:** Synapse has now installed the commands, triggers, and crons needed for this Power-Up. The backend service has successfully registered itself without requiring a human administrator to manually load packages.
+
+### 3. Data Flow: Synapse calling the Backend (User Commands)
+When an analyst types a command in Optic (e.g., `yara.scan_file`), here is the exact execution flow:
+
+1.  **Storm Execution:** Cortex begins executing the `yara.scan_file` Storm command.
+2.  **The HTTP Bridge:** The Storm command (installed during bootstrapping) contains `$lib.inet.http.post()`. It packages the current graph node (e.g., `file:bytes`) and context into a JSON payload.
+3.  **Egress:** Cortex makes an HTTP POST request to the Go/Rust backend service (e.g., `http://yara-backend:8080/scan`).
+4.  **Processing:** The Go/Rust service receives the JSON, performs the heavy lifting (scanning the file against YARA rules using a high-performance Rust library), and returns a JSON response to Synapse.
+5.  **Ingress:** The Storm script parses the JSON response and yields the new nodes (e.g., `it:app:yara:match`) directly to the analyst.
+
+### 4. Data Flow: The Backend calling Synapse (Background Sync)
+When the Advanced Power-Up acts as an active collector or scraper, it drives the flow:
+
+1.  **The Backend Loop:** The Go/Rust service runs a highly concurrent background worker pool (goroutines/Rust async). It connects to an external stream (e.g., a Firehose or MISP feed).
+2.  **Buffering:** As it receives raw threat data, it translates it into Synapse's node model natively in memory.
+3.  **Bulk Ingress:** Periodically (e.g., every 5 seconds or 10,000 events), the Go/Rust service formats a large Storm query containing all the new nodes and relationships.
+4.  **Execution:** It POSTs the Storm query to the Synapse `/api/v1/storm` endpoint.
+5.  **Result:** Cortex processes the query and updates the graph.
+
+### Why this is a Massive Upgrade
+By decoupling the backend service from Synapse's internal Python abstractions (`Cell`, `Telepath`):
+*   **Resilience:** If the Go service crashes, it does not disrupt the Cortex cluster.
+*   **Scale:** You can horizontally scale the Go/Rust collector pods independently of Cortex.
+*   **Polyglot:** You are no longer restricted to Python libraries for parsing complex file formats or handling high-throughput networking.
